@@ -1,0 +1,72 @@
+#!/bin/bash
+# backup all dynamodb tables to amazon s3 
+# this enables and requires point in time recovery, which can cost $$$, if you are on a budget uncomment the disable after backup 
+##TODO REWRITE THIS SCRIPT IN PYTHON
+
+#PATH for executables usually just /usr/local/bin
+PATH=/usr/local/bin:/usr/bin:/bin:
+
+#set region to east and then change it back to default
+REGION='us-east-1'
+BUCKET='YOURBUCKET'
+TABLE_LIST_JSON=$(aws dynamodb list-tables --region $REGION | jq -r .TableNames )
+TABLE_LIST=$(echo $TABLE_LIST_JSON | sed -e 's/\[ //g' -e 's/\ ]//g' -e 's/\,//g')
+echo "`date '+%F %T'` Beginning Dynamo S3 Export for ${TABLE_LIST}..." >> /var/logs/dynamodb-backups.log
+
+for table in ${TABLE_LIST[@]//\"}; do
+	
+	#enable point in time recovery
+	aws dynamodb update-continuous-backups \
+	--table-name $table \
+	--point-in-time-recovery-specification PointInTimeRecoveryEnabled=true \
+	--region $REGION
+	
+	## Get the dynamodb table arn
+	TABLE_ARN=$(aws dynamodb describe-table \
+	--table-name $table \
+	--region $REGION | jq -r .Table.TableArn)
+	echo "`date '+%F %T'` Backing up ${table} to S3..." >> /var/logs/dynamodb-backups.log
+	#echo $TABLE_ARN
+
+	## Export dynamodb table to S3 bucket
+	aws dynamodb export-table-to-point-in-time \
+	--table-arn $TABLE_ARN \
+	--s3-
+  \$BUCKET \
+	--s3-prefix dynamodbBackups \
+	--export-format DYNAMODB_JSON \
+	--region $REGION
+
+	COUNT=0
+	#check times out after 10 mins
+	while [ $COUNT -lt 20 ] 
+		do	
+		echo "${table} checking export status..."
+
+		## Check the export status
+		EXPORT_ARN=$(aws dynamodb list-exports \
+		--table-arn $TABLE_ARN \
+		--region $REGION | jq -r .ExportSummaries[0].ExportArn) &&
+		#echo $EXPORT_ARN
+		EXPORT_STATUS=$(aws dynamodb describe-export --export-arn $EXPORT_ARN --region $REGION | jq -r .ExportDescription.ExportStatus)
+		#echo $EXPORT_STATUS
+		if [ $EXPORT_STATUS == 'COMPLETED' ]; then 
+				#logging info
+				echo "`date '+%F %T'` ${table} Table export to s3 completed." >> /var/logs/dynamodb-backups.log
+				break
+		fi 
+		echo "`date '+%F %T'` ${table} Table export to s3 not completed. Waiting 30 secs to try again..." 
+		sleep 30
+		((COUNT++))
+		if [$COUNT = 20]; then
+			echo "[ERROR] `date '+%F %T'` ${table} Table export to s3 may not have completed. Proccess timed out. Please check manually.">> /var/logs/dynamodb-backups.log
+
+	done 
+	## Disable point in time recovery
+	#aws dynamodb update-continuous-backups \
+	#--table-name $table \
+	#--point-in-time-recovery-specification PointInTimeRecoveryEnabled=false \
+	#--region $REGION
+done
+
+export AWS_REGION=$DEFAULT_REGION
